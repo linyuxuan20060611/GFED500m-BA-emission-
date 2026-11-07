@@ -1,0 +1,296 @@
+"""拼接 GFED500 年度分块（保留 12 个月、MODIS 正弦投影及原始数值）。
+
+安装依赖：python -m pip install numpy netCDF4
+检查输入：python mosaic_gfed_2010.py --check-only
+开始拼接：python mosaic_gfed_2010.py
+
+本脚本针对实际检查过的 MOD_Grid/{emissions,burned_area} 数据结构。
+不做重投影、重采样或年度求和。输出不含原文件的 biomes 辅助分类层。
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+import os
+import re
+import time
+
+import numpy as np
+from netCDF4 import Dataset, num2date
+
+DEFAULT_INPUT = Path(
+    r"C:\Users\linyu\Desktop\科研\Model data for GFED（500m和0.25°）"
+    r"\500m 2002-2023的BA与emission数据\2010\500m_2010"
+)
+YEAR = 2010
+N = 2400
+NH, NV = 36, 18
+NX, NY = NH * N, NV * N
+XMIN, YMAX = -20015109.354, 10007554.677
+TILE_SIZE = 1111950.5196666666
+PIXEL = TILE_SIZE / N
+BLOCK = 800  # 对齐源文件的 [1,800,800] 压缩块
+FIELDS = {
+    "emissions": ("C_AG_TOT", "C_AG_FL", "C_BG_TOT", "C_BG_FL"),
+    "burned_area": ("BA_TOT", "BA_FL"),
+}
+PATTERN = re.compile(r"Model500m_2002-2023yr_h(\d{2})v(\d{2})_2010\.nc$")
+
+
+@contextmanager
+def open_nc(path, mode="r", **kwargs):
+    """绕过部分 Windows netCDF-C 版本不能打开中文完整路径的问题。
+
+    只在打开文件时临时切换目录；脚本单线程运行，不适合多线程调用。
+    输入和输出文件名均为 ASCII，父目录可以含中文。
+    """
+    path = Path(path).resolve()
+    previous = Path.cwd()
+    try:
+        os.chdir(path.parent)
+        ds = Dataset(path.name, mode, **kwargs)
+    finally:
+        os.chdir(previous)
+    try:
+        yield ds
+    finally:
+        ds.close()
+
+
+def same(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind in "fciu" and b.dtype.kind in "fciu":
+        return np.array_equal(a, b, equal_nan=True)
+    return np.array_equal(a, b)
+
+
+def attrs_equal(a, b):
+    return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+
+
+def discover(folder):
+    files = []
+    seen = set()
+    for path in sorted(folder.glob("Model500m_2002-2023yr_h??v??_2010.nc")):
+        m = PATTERN.fullmatch(path.name)
+        if not m:
+            continue
+        h, v = map(int, m.groups())
+        if not (0 <= h < NH and 0 <= v < NV):
+            raise ValueError(f"非法分块编号：{path.name}")
+        if (h, v) in seen:
+            raise ValueError(f"重复分块：h{h:02d}v{v:02d}")
+        seen.add((h, v))
+        files.append((path, h, v))
+    if not files:
+        raise FileNotFoundError(f"未找到 2010 年分块：{folder}")
+    return files
+
+
+def preflight(files):
+    """写文件前检查每个分块的尺寸、位置、月份、变量及编码。"""
+    reference = None
+    for i, (path, h, v) in enumerate(files, 1):
+        with open_nc(path) as ds:
+            g = ds.groups["MOD_Grid"]
+            if {k: len(g.dimensions[k]) for k in ("YDim", "XDim", "time")} != {
+                "YDim": N, "XDim": N, "time": 12
+            }:
+                raise ValueError(f"尺寸与预期不符：{path.name}")
+            if ds.getncattr("tile") != f"h{h:02d}v{v:02d}":
+                raise ValueError(f"文件名和 tile 属性不一致：{path.name}")
+            crs = g.variables["_HDFEOS_CRS"]
+            expected = np.array([XMIN + h*TILE_SIZE, PIXEL, 0,
+                                 YMAX - v*TILE_SIZE, 0, -PIXEL])
+            if crs.Projection != "GCTP_SNSOID" or not np.allclose(
+                crs.GeoTransform, expected, rtol=0, atol=0.002
+            ):
+                raise ValueError(f"投影或网格定位不符：{path.name}")
+            if not np.allclose(crs.UpperLeftPointMtrs, expected[[0, 3]], rtol=0, atol=0.002):
+                raise ValueError(f"左上角位置不符：{path.name}")
+            if not np.allclose(crs.LowerRightMtrs,
+                               [expected[0]+TILE_SIZE, expected[3]-TILE_SIZE],
+                               rtol=0, atol=0.002):
+                raise ValueError(f"右下角位置不符：{path.name}")
+            for axis, start, step in (("XDim", expected[0], PIXEL),
+                                      ("YDim", expected[3], -PIXEL)):
+                coord = g.variables[axis]
+                # 原文件坐标为 float32 千米、像元左/上边缘；允许浮点舍入。
+                if coord.units != "km" or not np.allclose(
+                    coord[:].astype("f8")*1000, start+np.arange(N)*step,
+                    rtol=0, atol=3.0
+                ):
+                    raise ValueError(f"{axis} 坐标不符合预期：{path.name}")
+            t = g.variables["time"]
+            dates = num2date(t[:], t.units, calendar=t.calendar)
+            if [(d.year, d.month) for d in dates] != [(YEAR, m) for m in range(1, 13)]:
+                raise ValueError(f"月份不是 2010 年 1—12 月：{path.name}")
+            schema = {}
+            for group, names in FIELDS.items():
+                for name in names:
+                    var = g.groups[group].variables[name]
+                    if var.dimensions != ("time", "YDim", "XDim") or var.dtype != np.dtype("f4"):
+                        raise ValueError(f"变量结构不符：{path.name}/{name}")
+                    schema[(group, name)] = dict(var.__dict__)
+            current = (np.asarray(t[:]), dict(t.__dict__),
+                       dict(g.variables["Projection"].__dict__), schema)
+            if reference is None:
+                reference = current
+            elif not (same(current[0], reference[0])
+                      and attrs_equal(current[1], reference[1])
+                      and attrs_equal(current[2], reference[2])
+                      and all(attrs_equal(schema[k], reference[3][k]) for k in schema)):
+                raise ValueError(f"时间轴、投影参数或变量属性不一致：{path.name}")
+        if i % 25 == 0 or i == len(files):
+            print(f"输入检查：{i}/{len(files)}", flush=True)
+    return reference
+
+
+def create_output(out, source, files):
+    """创建全球结构。未写入的 HDF5 块使用 NaN，不预分配全球数组。"""
+    stamp = datetime.now(timezone.utc).isoformat()
+    out.title = "GFED500 global monthly burned area and carbon emissions, 2010"
+    out.history = f"{stamp}: lossless tile mosaic by mosaic_gfed_2010.py"
+    out.source_directory = str(files[0][0].parent)
+    out.source_files = "\n".join(p.name for p, _, _ in files)
+    out.source_tile_count = len(files)
+    out.year = YEAR
+    out.nominal_resolution_m = 500
+    out.actual_grid_spacing_m = PIXEL
+    out.mosaic_status = "in_progress"
+    out.missing_tile_policy = "NaN; an absent tile is not assumed to have zero emissions or burned area."
+    out.coordinate_note = (
+        "Pixel-center coordinates in metres computed from source GeoTransform. "
+        "Source XDim/YDim are float32 edge coordinates in kilometres. "
+        "No resampling, reprojection or temporal aggregation was performed."
+    )
+    # 保留原始属性用于溯源，避免把单块 tile/路径属性误写为全球属性。
+    provenance = out.createGroup("source_metadata_first_tile")
+    provenance.setncatts(source.__dict__)
+    sg = source.groups["MOD_Grid"]
+    g = out.createGroup("MOD_Grid")
+    for name, size in (("time", 12), ("YDim", NY), ("XDim", NX)):
+        g.createDimension(name, size)
+    for name, size, start, step, axis, standard in (
+        ("XDim", NX, XMIN, PIXEL, "X", "projection_x_coordinate"),
+        ("YDim", NY, YMAX, -PIXEL, "Y", "projection_y_coordinate"),
+    ):
+        var = g.createVariable(name, "f8", (name,))
+        var.setncatts({"units": "m", "axis": axis, "standard_name": standard,
+                      "long_name": f"{axis.lower()} coordinate of pixel center"})
+        var[:] = start + (np.arange(size, dtype="f8")+0.5)*step
+    t = g.createVariable("time", sg.variables["time"].dtype, ("time",))
+    t.setncatts(sg.variables["time"].__dict__)
+    t[:] = sg.variables["time"][:]
+    proj = g.createVariable("Projection", "i4")
+    proj.setncatts(sg.variables["Projection"].__dict__)
+    proj.assignValue(0)
+    crs = g.createVariable("_HDFEOS_CRS", "i2")
+    crs.setncatts(sg.variables["_HDFEOS_CRS"].__dict__)
+    crs.UpperLeftPointMtrs = np.array([XMIN, YMAX])
+    crs.LowerRightMtrs = np.array([XMIN+NX*PIXEL, YMAX-NY*PIXEL])
+    crs.GeoTransform = np.array([XMIN, PIXEL, 0, YMAX, 0, -PIXEL])
+    crs.assignValue(0)
+    for group, names in FIELDS.items():
+        target = g.createGroup(group)
+        target.setncatts(sg.groups[group].__dict__)
+        for name in names:
+            src = sg.groups[group].variables[name]
+            var = target.createVariable(name, src.dtype, src.dimensions,
+                                        fill_value=np.float32(np.nan),
+                                        zlib=True, complevel=4, shuffle=True,
+                                        chunksizes=(1, BLOCK, BLOCK))
+            var.setncatts({k: val for k, val in src.__dict__.items() if k != "_FillValue"})
+            var.set_var_chunk_cache(8*1024*1024, 1009, 0.75)
+    g.createDimension("tile_v", NV)
+    g.createDimension("tile_h", NH)
+    for name, size in (("tile_v", NV), ("tile_h", NH)):
+        var = g.createVariable(name, "i2", (name,))
+        var[:] = np.arange(size)
+    present = g.createVariable("tile_present", "i1", ("tile_v", "tile_h"), fill_value=False)
+    present.long_name = "Source tile copied and verified: 1=yes, 0=not supplied"
+    present[:] = np.zeros((NV, NH), dtype="i1")
+
+
+def copy_month(src, dst, month, row, col):
+    """按 800×800 窗口复制一个月；自动解码缺测值后写入 NaN。"""
+    src.set_var_chunk_cache(8*1024*1024, 1009, 0.75)
+    for y in range(0, N, BLOCK):
+        for x in range(0, N, BLOCK):
+            y1, x1 = min(y+BLOCK, N), min(x+BLOCK, N)
+            data = np.ma.filled(src[month, y:y1, x:x1], np.nan)
+            dst[month, row+y:row+y1, col+x:col+x1] = data
+
+
+def verify_tile(source, out, h, v):
+    """每个变量、每个月核对四角与中心的 3×3 窗口（非全量校验）。"""
+    sg, dg = source.groups["MOD_Grid"], out.groups["MOD_Grid"]
+    for group, names in FIELDS.items():
+        for name in names:
+            src, dst = sg.groups[group].variables[name], dg.groups[group].variables[name]
+            for y, x in ((0, 0), (0, N-3), (N-3, 0), (N-3, N-3), (N//2, N//2)):
+                a = np.ma.filled(src[:, y:y+3, x:x+3], np.nan)
+                b = np.ma.filled(dst[:, v*N+y:v*N+y+3, h*N+x:h*N+x+3], np.nan)
+                if not same(a, b):
+                    raise RuntimeError(f"写入校验失败：h{h:02d}v{v:02d}/{name}")
+
+
+def run(folder, output_dir, check_only=False):
+    files = discover(folder)
+    preflight(files)
+    logical_gib = NY*NX*12*6*4/1024**3
+    print(f"分块数：{len(files)}；全球尺寸：{NY} 行 × {NX} 列；12 个月，6 个变量。")
+    print(f"完整未压缩数据量约 {logical_gib:.1f} GiB；实际磁盘量取决于压缩率。")
+    print(f"缺少的 {NH*NV-len(files)} 个网格分块保留 NaN，不代表下载一定不完整。")
+    if check_only:
+        print("检查通过；未创建拼接文件。")
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result = output_dir / "GFED500_BA_emissions_global_2010.nc"
+    partial = output_dir / "GFED500_BA_emissions_global_2010.partial.nc"
+    if result.exists() or partial.exists():
+        raise FileExistsError(f"为避免覆盖数据，请先移动已有结果或中断文件：{result} / {partial}")
+    start = time.monotonic()
+    print(f"开始写入：{partial}", flush=True)
+    # 保持默认 fill 模式：没有输入数据的块必须读为 NaN。
+    with open_nc(partial, "w", format="NETCDF4", clobber=False) as out:
+        with open_nc(files[0][0]) as first:
+            create_output(out, first, files)
+        for i, (path, h, v) in enumerate(files, 1):
+            with open_nc(path) as src:
+                for group, names in FIELDS.items():
+                    for name in names:
+                        sv = src.groups["MOD_Grid"].groups[group].variables[name]
+                        dv = out.groups["MOD_Grid"].groups[group].variables[name]
+                        for month in range(12):
+                            copy_month(sv, dv, month, v*N, h*N)
+                verify_tile(src, out, h, v)
+            out.groups["MOD_Grid"].variables["tile_present"][v, h] = 1
+            out.sync()
+            elapsed = time.monotonic()-start
+            remaining = elapsed/i*(len(files)-i)/60
+            print(f"[{i}/{len(files)}] h{h:02d}v{v:02d} 完成并抽样校验；"
+                  f"已用 {elapsed/60:.1f} 分钟，预计剩余 {remaining:.1f} 分钟", flush=True)
+        out.mosaic_status = "complete"
+    # 成功关闭后才改为最终文件名；中断时 .partial.nc 不能当成完整结果。
+    partial.rename(result)
+    print(f"完成：{result}\n文件大小：{result.stat().st_size/1024**3:.2f} GiB", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--check-only", action="store_true", help="仅检查所有分块，不生成全球文件")
+    args = parser.parse_args()
+    folder = args.input_dir.resolve()
+    destination = (args.output_dir or folder / "全球拼接结果").resolve()
+    run(folder, destination, args.check_only)
+
+
+if __name__ == "__main__":
+    main()
