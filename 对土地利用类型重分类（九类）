@@ -1,0 +1,176 @@
+from pathlib import Path
+from uuid import uuid4
+
+import h5netcdf
+import numpy as np
+
+
+# ==================== 输入和输出 ====================
+
+BASE = Path(
+    r"C:\Users\linyu\Desktop\科研\Model data for GFED（500m和0.25°）"
+    r"\500m 2002-2023的BA与emission数据\2010\500m_2010\全球拼接结果"
+)
+
+INPUT = BASE / "GFED500_all_variables_global_2010.nc"
+OUTPUT = BASE / "九类重分类结果" / "GFED500_landcover_9class.nc"
+
+
+# ==================== 分类映射 ====================
+
+# 左侧为输出代码，右侧为 GFED 模型原代码。
+GROUPS = {
+    1: [0],                    # 水体
+    2: [1, 2, 3],              # 森林
+    3: [4, 5, 6, 8, 9, 17],    # 灌木地与稀树草原
+    4: [7, 10],                # 草地
+    5: [12, 14, 19],           # 耕地
+    6: [11],                   # 湿地
+    7: [13],                   # 建设用地
+    8: [16],                   # 裸地与稀疏植被
+    9: [15],                   # 冰雪
+    254: [18],                 # 苔原待定
+}
+
+UNCLASSIFIED = 253
+FILL = 255
+
+LOOKUP = np.full(20, FILL, dtype=np.uint8)
+for new_code, old_codes in GROUPS.items():
+    LOOKUP[old_codes] = new_code
+
+
+def reclassify(raw, missing_values):
+    """转换一个窗口，分别处理已分类、原始未分类和缺失像元。"""
+    absent = np.isnan(raw) | np.isin(raw, missing_values)
+    unclassified = (~absent) & (raw == -1)
+
+    classified = (
+        (~absent)
+        & (raw >= 0)
+        & (raw <= 19)
+        & (raw == np.floor(raw))
+    )
+
+    unknown = ~(absent | unclassified | classified)
+    if unknown.any():
+        raise ValueError(
+            f"分类层出现尚未定义的原始值：{np.unique(raw[unknown])[:12]}"
+        )
+
+    result = np.full(raw.shape, FILL, dtype=np.uint8)
+    result[unclassified] = UNCLASSIFIED
+    result[classified] = LOOKUP[raw[classified].astype(np.intp)]
+    return result
+
+
+def copy_grid_variable(grid, out, name):
+    """复制源网格的坐标或投影变量，包括原属性。"""
+    src = grid.variables[name]
+    attributes = dict(src.attrs)
+    fill_value = attributes.pop("_FillValue", None)
+
+    dst = out.create_variable(
+        name, src.dimensions, dtype=src.dtype, fillvalue=fill_value
+    )
+    dst.attrs.update(attributes)
+    dst[...] = src[...]
+
+
+def main():
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    if OUTPUT.exists():
+        raise FileExistsError(f"目标文件已经存在：{OUTPUT}")
+
+    temp = OUTPUT.with_name(f".gfed9_{uuid4().hex}.tmp.nc")
+    counts = np.zeros(256, dtype=np.int64)
+
+    try:
+        # Python 打开含中文的路径；直接读取已确认的模型分类层。
+        with INPUT.open("rb") as stream, h5netcdf.File(stream, "r") as src:
+            grid = src.groups["MOD_Grid"]
+            biome = grid.groups["biomes"].variables["BIOME_TYPE"]
+
+            if tuple(biome.dimensions) != ("YDim", "XDim"):
+                raise ValueError(f"分类层维度与预期不符：{biome.dimensions}")
+
+            ny, nx = biome.shape
+            missing_values = []
+            for key in ("_FillValue", "missing_value"):
+                if key in biome.attrs:
+                    values = np.asarray(biome.attrs[key]).reshape(-1)
+                    missing_values.extend(values.tolist())
+
+            if any(value in range(-1, 20) for value in missing_values):
+                raise ValueError(f"文件声明的缺失值与模型分类代码冲突：{missing_values}")
+
+            print(f"输入文件：{INPUT}", flush=True)
+            print(f"分类层：/MOD_Grid/biomes/BIOME_TYPE", flush=True)
+            print(f"网格：{ny} 行 × {nx} 列；源缺失值：{missing_values}", flush=True)
+
+            with h5netcdf.File(temp, "w") as out:
+                out.dimensions = {"YDim": ny, "XDim": nx}
+
+                for name in ("YDim", "XDim", "Projection", "_HDFEOS_CRS"):
+                    copy_grid_variable(grid, out, name)
+
+                var = out.create_variable(
+                    "landcover_9class",
+                    ("YDim", "XDim"),
+                    dtype="u1",
+                    fillvalue=np.uint8(FILL),
+                    chunks=(min(800, ny), min(800, nx)),
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                var.attrs.update({
+                    "long_name": "GFED land cover reclassified to nine classes",
+                    "grid_mapping": "Projection",
+                    "coordinates": "XDim YDim",
+                    "source_variable": "/MOD_Grid/biomes/BIOME_TYPE",
+                    "flag_values": np.array(
+                        [1, 2, 3, 4, 5, 6, 7, 8, 9, 253, 254], dtype=np.uint8
+                    ),
+                    "flag_meanings": (
+                        "water forest shrubland_and_savanna grassland cropland "
+                        "wetland built_up barren_and_sparse_vegetation snow_and_ice "
+                        "source_unclassified unassigned_tundra"
+                    ),
+                    "source_to_target": "-1->253, " + ", ".join(
+                        f"{old}->{new}" for old, new in enumerate(LOOKUP)
+                    ),
+                })
+                out.attrs["source_file"] = INPUT.name
+
+                for y in range(0, ny, 800):
+                    end_y = min(y + 800, ny)
+
+                    for x in range(0, nx, 2400):
+                        end_x = min(x + 2400, nx)
+                        window = (slice(y, end_y), slice(x, end_x))
+                        block = reclassify(biome[window], missing_values)
+
+                        # 全缺失窗口由 NetCDF 的填充值自动表示。
+                        if np.any(block != FILL):
+                            var[window] = block
+
+                        counts += np.bincount(block.ravel(), minlength=256)
+
+                    print(f"\r重分类进度：{end_y / ny:.1%}", end="", flush=True)
+
+        if counts.sum() != ny * nx:
+            raise RuntimeError("处理的像元总数与输入网格不符。")
+
+        temp.rename(OUTPUT)
+        print(f"\n完成：{OUTPUT}")
+        print(f"耕地像元：{counts[5]:,}")
+        print(f"GFED 原始未分类像元：{counts[253]:,}")
+        print(f"苔原待定像元：{counts[254]:,}")
+        print(f"缺失像元：{counts[255]:,}")
+
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()
