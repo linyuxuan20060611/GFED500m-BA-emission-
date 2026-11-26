@@ -1,0 +1,357 @@
+from contextlib import contextmanager
+from hashlib import sha256
+from pathlib import Path
+import base64
+import json
+import os
+import re
+from uuid import uuid4
+
+import numpy as np
+from netCDF4 import Dataset
+
+
+SOURCE = Path(
+    r"C:\Users\linyu\Desktop\科研\Model data for GFED（500m和0.25°）"
+    r"\500m 2002-2023的BA与emission数据\2010\500m_2010"
+)
+OUTPUT = SOURCE / "全球拼接结果" / "GFED500_all_variables_global_2010.nc"
+
+PATTERN = re.compile(r"Model500m_2002-2023yr_h(\d{2})v(\d{2})_2010\.nc$", re.I)
+GRID = "/MOD_Grid"
+CRS = GRID + "/_HDFEOS_CRS"
+BIOME = GRID + "/biomes/BIOME_TYPE"
+X, Y = "XDim", "YDim"
+NH, NV = 36, 18
+ARCHIVE = "_source_tile_metadata"
+
+
+@contextmanager
+def open_nc(path, mode="r"):
+    # 已有实际读取记录显示，在这个目录下用英文文件名打开可成功。
+    # 中文父目录由 Python 处理，netCDF4 只接收文件名。
+    old_dir = Path.cwd()
+    try:
+        os.chdir(path.parent)
+        ds = Dataset(path.name, mode)
+    finally:
+        os.chdir(old_dir)
+    try:
+        ds.set_auto_maskandscale(False)
+        ds.set_auto_chartostring(False)
+        yield ds
+    finally:
+        ds.close()
+
+
+def walk(group):
+    yield group
+    for child in group.groups.values():
+        yield from walk(child)
+
+
+def fullpath(group, name):
+    return group.path.rstrip("/") + "/" + name
+
+
+def all_vars(ds):
+    return {
+        fullpath(g, name): var
+        for g in walk(ds)
+        for name, var in g.variables.items()
+    }
+
+
+def attrs(obj):
+    return {k: obj.getncattr(k) for k in obj.ncattrs()}
+
+
+def encode_attr(value):
+    # 保存每个分块自己的原属性，包括数组类型、NaN 和投影边界。
+    if isinstance(value, str):
+        return {"text": value}
+    arr = np.asarray(value)
+    if arr.dtype.kind in "OU":
+        return {"dtype": str(arr.dtype), "shape": arr.shape, "values": arr.tolist()}
+    return {
+        "dtype": arr.dtype.str,
+        "shape": arr.shape,
+        "base64": base64.b64encode(arr.tobytes()).decode("ascii"),
+    }
+
+
+def metadata(ds):
+    record = {}
+    for g in walk(ds):
+        record[g.path] = {
+            "attributes": {k: encode_attr(v) for k, v in attrs(g).items()},
+            "dimensions": {
+                k: [len(d), d.isunlimited()] for k, d in g.dimensions.items()
+            },
+            "variables": {
+                k: {
+                    "dtype": str(v.dtype),
+                    "dimensions": v.dimensions,
+                    "attributes": {a: encode_attr(b) for a, b in attrs(v).items()},
+                }
+                for k, v in g.variables.items()
+            },
+        }
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+
+def schema(ds):
+    groups = {
+        g.path: {k: (len(d), d.isunlimited()) for k, d in g.dimensions.items()}
+        for g in walk(ds)
+    }
+    variables = {
+        p: (str(v.dtype), tuple(v.dimensions), tuple(v.shape))
+        for p, v in all_vars(ds).items()
+    }
+    return groups, variables
+
+
+def get_group(ds, path):
+    if path in ("", "/"):
+        return ds
+    group = ds
+    for name in path.strip("/").split("/"):
+        if name not in group.groups:
+            group.createGroup(name)
+        group = group.groups[name]
+    return group
+
+
+def windows(var, h, v, nx, ny):
+    # 每次最多读写一个月份的数据；二维生物群系层只写一次。
+    dims = var.dimensions
+    time_axis = dims.index("time") if "time" in dims else None
+    steps = range(var.shape[time_axis]) if time_axis is not None else (None,)
+    for t in steps:
+        local, global_ = [], []
+        for dim, length in zip(dims, var.shape):
+            if dim == "time":
+                local.append(t)
+                global_.append(t)
+            elif dim == X:
+                local.append(slice(None))
+                global_.append(slice(h * nx, (h + 1) * nx))
+            elif dim == Y:
+                local.append(slice(None))
+                global_.append(slice(v * ny, (v + 1) * ny))
+            else:
+                local.append(slice(None))
+                global_.append(slice(0, length))
+        yield tuple(local), tuple(global_)
+
+
+def digest_update(digest, values):
+    digest.update(np.ascontiguousarray(values).tobytes())
+
+
+def run():
+    tiles = []
+    occupied = set()
+    for p in sorted(SOURCE.glob("*.nc")):
+        match = PATTERN.fullmatch(p.name)
+        if not match:
+            continue
+        h, v = map(int, match.groups())
+        if not (0 <= h < NH and 0 <= v < NV) or (h, v) in occupied:
+            raise ValueError(f"分块编号越界或重复：{p.name}")
+        occupied.add((h, v))
+        tiles.append((p, h, v))
+
+    if not tiles:
+        raise FileNotFoundError(f"没有找到原始 GFED 分块：{SOURCE}")
+    if OUTPUT.exists():
+        raise FileExistsError(f"目标文件已经存在：{OUTPUT}")
+
+    first, h0, v0 = tiles[0]
+    with open_nc(first) as src:
+        reference = schema(src)
+        reference_vars = all_vars(src)
+        if BIOME not in reference_vars:
+            raise ValueError(f"{first.name} 缺少 {BIOME}")
+        if ARCHIVE in src.groups:
+            raise ValueError(f"原文件中已存在保留分组名 {ARCHIVE}")
+
+        grid = src[GRID]
+        nx, ny = len(grid.dimensions[X]), len(grid.dimensions[Y])
+        gt = np.asarray(src[CRS].getncattr("GeoTransform"), dtype=float).reshape(6)
+        x0, dx, rx, y0, ry, dy = gt
+        if rx != 0 or ry != 0 or dx <= 0 or dy >= 0:
+            raise ValueError(f"不支持的源网格变换：{gt}")
+        left = x0 - h0 * nx * dx
+        top = y0 - v0 * ny * dy
+
+        # 原数据 XDim、YDim 的单位为 km，保留源文件的坐标约定。
+        xvar, yvar = grid.variables[X], grid.variables[Y]
+        if xvar.units.strip() != "km" or yvar.units.strip() != "km":
+            raise ValueError("源坐标单位与原始读取记录中的 km 不一致。")
+        x_start = float(xvar[0]) - h0 * nx * dx / 1000
+        y_start = float(yvar[0]) - v0 * ny * dy / 1000
+
+        common = {}
+        for g in walk(src):
+            common[("group", g.path)] = attrs(g)
+        for p, var in reference_vars.items():
+            common[("var", p)] = attrs(var)
+
+    print(f"发现 {len(tiles)} 个分块；全球网格 {NV * ny} 行 × {NH * nx} 列。")
+    print("源文件中的全部变量：")
+    for p in sorted(reference[1]):
+        print(" ", p, reference[1][p])
+
+    tile_metadata = {}
+    essential = {
+        "_FillValue", "scale_factor", "add_offset", "_Unsigned", "units",
+        "calendar", "grid_mapping", "coordinates", "biomes_json",
+        "Projection", "ProjParams", "proj4", "earth_radius",
+    }
+
+    # 第一遍只读文件头。任何分块新增、缺少变量或维度不一致都会报出文件名。
+    for index, (p, h, v) in enumerate(tiles, 1):
+        with open_nc(p) as src:
+            current = schema(src)
+            if current != reference:
+                missing = sorted(reference[1].keys() - current[1].keys())
+                extra = sorted(current[1].keys() - reference[1].keys())
+                raise ValueError(
+                    f"{p.name} 的结构、数据类型或维度不一致。\n"
+                    f"缺少变量：{missing}\n额外变量：{extra}"
+                )
+
+            actual_gt = np.asarray(src[CRS].getncattr("GeoTransform")).reshape(6)
+            expected_gt = [left + h * nx * dx, dx, 0, top + v * ny * dy, 0, dy]
+            if not np.allclose(actual_gt, expected_gt, rtol=0,
+                               atol=[0.2, 1e-6, 1e-9, 0.2, 1e-9, 1e-6]):
+                raise ValueError(f"{p.name} 的投影位置与 h/v 编号不符。")
+
+            tile_metadata[p.name] = metadata(src)
+            objects = {("group", g.path): g for g in walk(src)}
+            objects.update({("var", k): val for k, val in all_vars(src).items()})
+            for key, obj in objects.items():
+                original = common[key]
+                actual = attrs(obj)
+                for a in essential:
+                    if a in original or a in actual:
+                        if (a not in original or a not in actual
+                                or encode_attr(original[a]) != encode_attr(actual[a])):
+                            raise ValueError(f"{p.name} 的 {key[1]} 属性 {a} 不一致。")
+                for a in list(original):
+                    if a not in actual or encode_attr(original[a]) != encode_attr(actual[a]):
+                        del original[a]
+
+        if index % 25 == 0 or index == len(tiles):
+            print(f"检查分块 {index}/{len(tiles)}", flush=True)
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    temp = OUTPUT.with_name(f".GFED_full_{uuid4().hex}.partial.nc")
+    checksums = {}
+
+    try:
+        with open_nc(first) as template, open_nc(temp, "w") as out:
+            # 保留原分组树和维度。仅把空间维度扩展到全球大小。
+            for original in walk(template):
+                target = get_group(out, original.path)
+                target.setncatts(common[("group", original.path)])
+                for name, dim in original.dimensions.items():
+                    if name == X:
+                        size = NH * nx
+                    elif name == Y:
+                        size = NV * ny
+                    else:
+                        size = None if dim.isunlimited() else len(dim)
+                    target.createDimension(name, size)
+
+            for path, source_var in all_vars(template).items():
+                parent, name = path.rsplit("/", 1)
+                target = get_group(out, parent)
+                att = dict(common[("var", path)])
+                opts = {}
+                fill = att.pop("_FillValue", None)
+                spatial = X in source_var.dimensions or Y in source_var.dimensions
+
+                if fill is not None:
+                    opts["fill_value"] = fill
+                elif spatial and np.issubdtype(source_var.dtype, np.floating):
+                    opts["fill_value"] = np.array(np.nan, dtype=source_var.dtype)[()]
+                elif path == BIOME:
+                    # -1 是有效的“未分类”，0 是水体。无源分块另用 -127。
+                    opts["fill_value"] = np.int8(-127)
+
+                if spatial:
+                    opts.update(zlib=True, complevel=1, chunksizes=tuple(
+                        min(800, n) if d in (X, Y) else 1
+                        for d, n in zip(source_var.dimensions, source_var.shape)
+                    ))
+                dest = target.createVariable(
+                    name, source_var.datatype, source_var.dimensions, **opts
+                )
+                dest.setncatts(att)
+                dest.set_auto_maskandscale(False)
+                dest.set_auto_chartostring(False)
+
+            # 源分块各自的属性完整保存在文件内部，包括原投影边界和模型参数。
+            archive = out.createGroup(ARCHIVE)
+            for filename, record in tile_metadata.items():
+                item = archive.createGroup(filename.removesuffix(".nc"))
+                item.setncattr("metadata_json", record)
+
+            # 全球投影边界。源瓦片自己的边界已逐块归档。
+            crs = out[CRS]
+            crs.setncattr("GeoTransform", np.array([left, dx, 0, top, 0, dy]))
+            crs.setncattr("UpperLeftPointMtrs", np.array([left, top]))
+            crs.setncattr("LowerRightMtrs", np.array([
+                left + NH * nx * dx, top + NV * ny * dy,
+            ]))
+
+            # 缺少分块的行列也有坐标。存在源分块的位置随后写回原始坐标值。
+            out[GRID + "/" + X][:] = x_start + np.arange(NH * nx) * dx / 1000
+            out[GRID + "/" + Y][:] = y_start + np.arange(NV * ny) * dy / 1000
+
+            for index, (p, h, v) in enumerate(tiles, 1):
+                with open_nc(p) as src:
+                    for path, source_var in all_vars(src).items():
+                        dest = out[path]
+                        digest = sha256()
+                        for source_slice, dest_slice in windows(source_var, h, v, nx, ny):
+                            raw = np.asarray(source_var[source_slice])
+                            digest_update(digest, raw)
+                            dest[dest_slice] = raw
+                        checksums[(p.name, path)] = digest.digest()
+                print(f"拼接 {index}/{len(tiles)}  {p.name}", flush=True)
+
+        # 关闭并重新打开成品，逐块、逐变量全量回读。
+        # 此处也会检出不同分块的公共时间轴或重复坐标相互覆盖的问题。
+        with open_nc(temp) as out:
+            expected = set(reference[1])
+            actual = set(all_vars(out))
+            if expected != actual:
+                raise RuntimeError(f"成品变量清单不符：{expected ^ actual}")
+            if len(out.groups[ARCHIVE].groups) != len(tiles):
+                raise RuntimeError("成品中保存的源分块元数据数量不符。")
+
+            for index, (p, h, v) in enumerate(tiles, 1):
+                with open_nc(p) as src:
+                    for path, source_var in all_vars(src).items():
+                        digest = sha256()
+                        for _, dest_slice in windows(source_var, h, v, nx, ny):
+                            digest_update(digest, out[path][dest_slice])
+                        if digest.digest() != checksums[(p.name, path)]:
+                            raise RuntimeError(f"数值校验失败：{p.name}，变量 {path}")
+                if index % 10 == 0 or index == len(tiles):
+                    print(f"回读校验 {index}/{len(tiles)}", flush=True)
+
+        temp.rename(OUTPUT)
+        print(f"\n完整拼接和校验通过：\n{OUTPUT}")
+
+    except BaseException:
+        print(f"\n任务未完成。若已开始写入，临时文件位于：\n{temp}")
+        raise
+
+
+if __name__ == "__main__":
+    run()
